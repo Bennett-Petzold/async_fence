@@ -1,1 +1,1 @@
-searchState.loadedDescShard("async_fence", 0, "")
+searchState.loadedDescShard("async_fence", 0, "<code>async_fence</code> provies <code>no_std</code> async fences and OnceLock.")
