@@ -1,0 +1,14 @@
+[package]
+name = "async_fence"
+version = "0.1.0"
+authors = ["Bennett Petzold <dansecob.dev@gmail.com>"]
+edition = "2024"
+rust-version = "1.85"
+description = "no-std async fences and OnceLock"
+repository = "https://github.com/Bennett-Petzold/async_fence"
+license = "MPL-2.0"
+categories = ["no-std::no-alloc", "asynchronous"]
+keywords = ["fence", "once"]
+readme = "README.md"
+
+[dependencies]
