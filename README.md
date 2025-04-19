@@ -4,7 +4,7 @@
 [![Coverage][Coverage]][CoveragePages]
 
 # async\_fence
-`no-std` async fences and OnceLock.
+`no_std` async fences and OnceLock.
 Defines a core `async_fence` that creates one notifier and some number of
 waiters.
 The number of waiters can be either static (for `no_alloc`), or dynamic (with
