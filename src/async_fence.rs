@@ -148,6 +148,8 @@ where
 /// re-queue instead of efficiently waiting on a callback. Excess waiters are
 /// inefficient (they constantly adjust an atomic pointer) and strongly not
 /// recommended.
+///
+/// [`Clone`] creates a new waiter with its own [`Waker`] storage.
 #[derive(Debug)]
 pub struct FenceWaiter<'a, Arr: AsMut<[FenceWaker]>> {
     state: FenceWaiterState,
@@ -159,6 +161,19 @@ pub struct FenceWaiter<'a, Arr: AsMut<[FenceWaker]>> {
 pub enum FenceWaiterState {
     Uninitialized,
     Waiting { queue_pos: usize },
+}
+
+impl<Arr> Clone for FenceWaiter<'_, Arr>
+where
+    Arr: AsMut<[FenceWaker]>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            state: FenceWaiterState::Uninitialized,
+            queue: self.queue,
+            finished: self.finished,
+        }
+    }
 }
 
 impl<Arr> Fence<Arr>
