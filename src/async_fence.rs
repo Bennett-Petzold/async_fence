@@ -4,7 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-/*! Defines the core async wait for one waker. */
+/*! Defines the core async wait for a waker. */
 
 use core::{
     mem::MaybeUninit,
@@ -21,6 +21,11 @@ extern crate alloc;
 
 pub type FenceWaker = SpinMutex<MaybeUninit<Waker>>;
 
+/// Asynchronous fence.
+///
+/// [`Self::wait`] creates futures that delay until a [`Self::hold`] handle is
+/// dropped (released). Both types of handles borrow from the fence -- it acts
+/// as a context and must be kept alive for full fencing interaction.
 #[derive(Debug)]
 pub struct Fence<Queue: AsRef<[FenceWaker]>> {
     queue: Queue,
@@ -32,21 +37,16 @@ impl<Queue> Fence<Queue>
 where
     Queue: AsRef<[FenceWaker]>,
 {
-    pub const fn new(queue: Queue) -> Self {
+    /// Creates a new fence on the empty queue.
+    ///
+    /// # Safety
+    /// The queue *must* be fully uninitialized.
+    pub const unsafe fn new(queue: Queue) -> Self {
         Self {
             queue,
             queue_pos: AtomicUsize::new(0),
             finished: AtomicBool::new(false),
         }
-    }
-}
-
-impl<Queue> Default for Fence<Queue>
-where
-    Queue: AsRef<[FenceWaker]> + Default,
-{
-    fn default() -> Self {
-        Self::new(Queue::default())
     }
 }
 
@@ -68,6 +68,12 @@ where
     }
 }
 
+/// Releases the [`Fence`] on [`Drop`].
+///
+/// This is constructed via [`Fence::hold`].
+/// All fields are borrowed from the originating [`Fence`].
+/// ANY copy of this for a given [`Fence`] will release the fence.
+/// Once the [`Fence`] is released, it cannot be re-enabled.
 #[derive(Debug, Clone)]
 pub struct FenceHolder<'a> {
     queue: &'a [FenceWaker],
@@ -79,6 +85,7 @@ impl<Queue> Fence<Queue>
 where
     Queue: AsRef<[FenceWaker]>,
 {
+    /// Produces a handle to release the fence on drop.
     pub fn hold<'a>(&'a self) -> FenceHolder<'a>
     where
         Queue: 'a,
@@ -108,6 +115,14 @@ impl Drop for FenceHolder<'_> {
     }
 }
 
+/// Waits for a [`Fence`] to release via [`FenceHolder`].
+///
+/// When [`Future::poll`] finishes, the [`Fence`] is released.
+///
+/// It is possible to produce more waiters than there is capacity in the
+/// [`Fence`]. Any excess waiters will check for completion and immediately
+/// re-queue instead of efficiently waiting on a callback. Excess waiters are
+/// inefficient and strongly not recommended.
 #[derive(Debug)]
 pub struct FenceWaiter<'a> {
     state: FenceWaiterState<'a>,
@@ -130,6 +145,7 @@ impl<Queue> Fence<Queue>
 where
     Queue: AsRef<[FenceWaker]>,
 {
+    /// Produces a handle to release the fence on drop.
     pub fn wait<'a>(&'a self) -> FenceWaiter<'a>
     where
         Queue: 'a,
