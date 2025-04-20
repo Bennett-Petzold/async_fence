@@ -44,6 +44,9 @@ where
 /// [`Self::wait`] creates futures that delay until a [`Self::hold`] handle is
 /// dropped (released). Both types of handles borrow from the fence -- it acts
 /// as a context and must be kept alive for full fencing interaction.
+///
+/// Use [`Self::new_arr_const`] for statically sized fences. Use
+/// [`Self::default`] for dynamically sized fences.
 #[derive(Debug)]
 pub struct Fence<Arr: AsMut<[FenceWaker]>> {
     queue: SpinMutex<FenceQueue<Arr>>,
@@ -84,6 +87,32 @@ where
                 drop(local_entry);
             }
         }
+    }
+}
+
+impl<Arr> Default for Fence<Arr>
+where
+    Arr: AsMut<[FenceWaker]> + Default,
+{
+    fn default() -> Self {
+        // Since [`FenceWaker`] is not [`Default`], any [`Default`] container
+        // must not initialize its elements. Zero elements meets the all
+        // elements uninit criteria.
+        unsafe { Self::new(Arr::default()) }
+    }
+}
+
+pub type StaticFence<const N: usize> = Fence<[FenceWaker; N]>;
+
+impl<const N: usize> StaticFence<N> {
+    pub const fn new_arr_const() -> Self {
+        // This works because:
+        //  1. All of the elements are still marked MaybeUninit
+        //  2. Arrays have no metadata: https://doc.rust-lang.org/reference/type-layout.html#r-layout.array
+        let arr = unsafe { MaybeUninit::<[FenceWaker; N]>::uninit().assume_init() };
+
+        // Created with all uninit elements, so this call is safe.
+        unsafe { Self::new(arr) }
     }
 }
 
