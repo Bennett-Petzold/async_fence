@@ -4,6 +4,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+#![no_std]
+
 /*!
 `async_fence` provies `no_std` async fences and OnceLock.
 
@@ -20,3 +22,6 @@ consider reaching out to `dansecob.dev@gmail.com` to make a financial contributi
 Contributions are welcome at
 <https://github.com/Bennett-Petzold/async_fence>.
 */
+
+mod async_fence;
+pub use async_fence::*;
