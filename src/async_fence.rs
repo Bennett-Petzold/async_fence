@@ -188,7 +188,7 @@ where
                 let mut local_entry = MaybeUninit::uninit();
                 core::mem::swap(entry, &mut local_entry);
                 let local_entry = unsafe { local_entry.assume_init() };
-                drop(local_entry);
+                local_entry.wake();
             }
         }
     }
@@ -212,7 +212,7 @@ pub struct FenceWaiter<'a, Arr: AsMut<[FenceWaker]>> {
     finished: &'a AtomicBool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum FenceWaiterState {
     Uninitialized,
     Waiting { queue_pos: usize },
@@ -300,6 +300,93 @@ where
         } else {
             cx.waker().wake_by_ref();
             Poll::Pending
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::time::Duration;
+
+    use futures::poll;
+    use tokio::{task::JoinSet, time::timeout};
+
+    use super::*;
+
+    const FENCE_LEN: usize = 3;
+
+    #[tokio::test]
+    async fn waits_on_handle() {
+        static FENCE: StaticFence<FENCE_LEN> = StaticFence::new_arr();
+
+        let holder = FENCE.hold();
+
+        let mut handles = JoinSet::new();
+        for _ in 0..FENCE_LEN {
+            handles.spawn(FENCE.wait());
+        }
+
+        // None of the waiters finish before the holder is dropped.
+        assert!(
+            timeout(Duration::from_secs(1), handles.join_next())
+                .await
+                .is_err()
+        );
+
+        // After the holder is dropped, all the waiters finish.
+        drop(holder);
+        assert!(
+            timeout(Duration::from_secs(1), handles.join_all())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_state_transitions() {
+        static FENCE: StaticFence<FENCE_LEN> = StaticFence::new_arr();
+
+        let handles: [_; FENCE_LEN] = core::array::from_fn(|_| FENCE.wait());
+
+        for (idx, mut handle) in handles.into_iter().enumerate() {
+            assert_eq!(handle.state, FenceWaiterState::Uninitialized);
+
+            // Need to loop because of spurious failures
+            let mut state = handle.state;
+            for _ in 0..10 {
+                assert_eq!(poll!(&mut handle), Poll::Pending);
+                state = handle.state;
+                if state == (FenceWaiterState::Waiting { queue_pos: idx }) {
+                    break;
+                }
+            }
+            assert_eq!(state, FenceWaiterState::Waiting { queue_pos: idx });
+        }
+    }
+
+    #[tokio::test]
+    async fn instant_pass_post_hold() {
+        static FENCE: StaticFence<FENCE_LEN> = StaticFence::new_arr();
+
+        drop(FENCE.hold());
+        let handles: [_; FENCE_LEN] = core::array::from_fn(|_| FENCE.wait());
+
+        for handle in handles {
+            assert_eq!(poll!(handle), Poll::Ready(()));
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_fence_hold_drop() {
+        static FENCE: StaticFence<FENCE_LEN> = StaticFence::new_arr();
+
+        drop(FENCE.hold());
+        let handles: [_; FENCE_LEN] = core::array::from_fn(|_| FENCE.wait());
+        // This should have absolutely zero effect on state.
+        drop(FENCE.hold());
+
+        for handle in handles {
+            assert_eq!(poll!(handle), Poll::Ready(()));
         }
     }
 }
