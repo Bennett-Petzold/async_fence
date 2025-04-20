@@ -8,9 +8,8 @@
 
 use core::{
     mem::MaybeUninit,
-    ops::DerefMut,
     pin::Pin,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll, Waker},
 };
 
@@ -19,7 +18,26 @@ use spin::mutex::SpinMutex;
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
-pub type FenceWaker = SpinMutex<MaybeUninit<Waker>>;
+pub type FenceWaker = MaybeUninit<Waker>;
+
+#[derive(Debug)]
+pub struct FenceQueue<Arr: AsMut<[FenceWaker]>> {
+    data: Arr,
+    pos: usize,
+}
+
+impl<Arr> FenceQueue<Arr>
+where
+    Arr: AsMut<[FenceWaker]>,
+{
+    /// Creates a new shared queue.
+    ///
+    /// # Safety
+    /// The queue *must* be entirely filled as [`MaybeUninit::uninit`].
+    pub const unsafe fn new(data: Arr) -> Self {
+        Self { data, pos: 0 }
+    }
+}
 
 /// Asynchronous fence.
 ///
@@ -27,42 +45,43 @@ pub type FenceWaker = SpinMutex<MaybeUninit<Waker>>;
 /// dropped (released). Both types of handles borrow from the fence -- it acts
 /// as a context and must be kept alive for full fencing interaction.
 #[derive(Debug)]
-pub struct Fence<Queue: AsRef<[FenceWaker]>> {
-    queue: Queue,
-    queue_pos: AtomicUsize,
+pub struct Fence<Arr: AsMut<[FenceWaker]>> {
+    queue: SpinMutex<FenceQueue<Arr>>,
     finished: AtomicBool,
 }
 
-impl<Queue> Fence<Queue>
+impl<Arr> Fence<Arr>
 where
-    Queue: AsRef<[FenceWaker]>,
+    Arr: AsMut<[FenceWaker]>,
 {
     /// Creates a new fence on the empty queue.
     ///
     /// # Safety
-    /// The queue *must* be fully uninitialized.
-    pub const unsafe fn new(queue: Queue) -> Self {
+    /// The queue *must* be entirely filled as [`MaybeUninit::uninit`].
+    pub const unsafe fn new(queue: Arr) -> Self {
         Self {
-            queue,
-            queue_pos: AtomicUsize::new(0),
+            queue: SpinMutex::new(unsafe { FenceQueue::new(queue) }),
             finished: AtomicBool::new(false),
         }
     }
 }
 
-impl<Queue> Drop for Fence<Queue>
+impl<Arr> Drop for Fence<Arr>
 where
-    Queue: AsRef<[FenceWaker]>,
+    Arr: AsMut<[FenceWaker]>,
 {
     fn drop(&mut self) {
+        let mut queue = self.queue.lock();
+        let pos = queue.pos;
+
         // Cleans up any wakers left over by a fence holder
-        let queue_past_end = self.queue_pos.load(Ordering::Acquire);
-        if queue_past_end > 0 {
-            for entry in &self.queue.as_ref()[0..queue_past_end] {
+        if pos > 0 {
+            // All indicies before the pointer are initialized wakers
+            for entry in &mut queue.data.as_mut()[0..pos] {
                 let mut local_entry = MaybeUninit::uninit();
-                core::mem::swap(entry.lock().deref_mut(), &mut local_entry);
+                core::mem::swap(entry, &mut local_entry);
                 let local_entry = unsafe { local_entry.assume_init() };
-                local_entry.wake();
+                drop(local_entry);
             }
         }
     }
@@ -75,41 +94,46 @@ where
 /// ANY copy of this for a given [`Fence`] will release the fence.
 /// Once the [`Fence`] is released, it cannot be re-enabled.
 #[derive(Debug, Clone)]
-pub struct FenceHolder<'a> {
-    queue: &'a [FenceWaker],
-    queue_pos: &'a AtomicUsize,
+pub struct FenceHolder<'a, Arr: AsMut<[FenceWaker]>> {
+    queue: &'a SpinMutex<FenceQueue<Arr>>,
     finished: &'a AtomicBool,
 }
 
-impl<Queue> Fence<Queue>
+impl<Arr> Fence<Arr>
 where
-    Queue: AsRef<[FenceWaker]>,
+    Arr: AsMut<[FenceWaker]>,
 {
     /// Produces a handle to release the fence on drop.
-    pub fn hold<'a>(&'a self) -> FenceHolder<'a>
+    pub fn hold<'a>(&'a self) -> FenceHolder<'a, Arr>
     where
-        Queue: 'a,
+        Arr: 'a,
     {
         FenceHolder {
-            queue: self.queue.as_ref(),
-            queue_pos: &self.queue_pos,
+            queue: &self.queue,
             finished: &self.finished,
         }
     }
 }
 
-impl Drop for FenceHolder<'_> {
+impl<Arr> Drop for FenceHolder<'_, Arr>
+where
+    Arr: AsMut<[FenceWaker]>,
+{
     fn drop(&mut self) {
         self.finished.store(true, Ordering::Release);
 
-        // Zeroing out the queue pointer makes any future FenceHolders skip
-        let queue_past_end = self.queue_pos.swap(0, Ordering::AcqRel);
-        if queue_past_end > 0 {
-            for entry in &self.queue[0..queue_past_end] {
+        // Cleans up any wakers left over by a fence holder
+        let mut queue = self.queue.lock();
+        if queue.pos > 0 {
+            // Zeroing out the queue pointer makes any future FenceHolders skip
+            let pos = core::mem::replace(&mut queue.pos, 0);
+
+            // All indicies before the pointer are initialized wakers
+            for entry in &mut queue.data.as_mut()[0..pos] {
                 let mut local_entry = MaybeUninit::uninit();
-                core::mem::swap(entry.lock().deref_mut(), &mut local_entry);
+                core::mem::swap(entry, &mut local_entry);
                 let local_entry = unsafe { local_entry.assume_init() };
-                local_entry.wake();
+                drop(local_entry);
             }
         }
     }
@@ -122,115 +146,89 @@ impl Drop for FenceHolder<'_> {
 /// It is possible to produce more waiters than there is capacity in the
 /// [`Fence`]. Any excess waiters will check for completion and immediately
 /// re-queue instead of efficiently waiting on a callback. Excess waiters are
-/// inefficient and strongly not recommended.
+/// inefficient (they constantly adjust an atomic pointer) and strongly not
+/// recommended.
 #[derive(Debug)]
-pub struct FenceWaiter<'a> {
-    state: FenceWaiterState<'a>,
+pub struct FenceWaiter<'a, Arr: AsMut<[FenceWaker]>> {
+    state: FenceWaiterState,
+    queue: &'a SpinMutex<FenceQueue<Arr>>,
     finished: &'a AtomicBool,
 }
 
 #[derive(Debug)]
-pub enum FenceWaiterState<'a> {
-    Uninitialized {
-        queue: &'a [FenceWaker],
-        queue_pos: &'a AtomicUsize,
-    },
-    Waiting {
-        waker: &'a FenceWaker,
-    },
-    Overcapacity,
+pub enum FenceWaiterState {
+    Uninitialized,
+    Waiting { queue_pos: usize },
 }
 
-impl<Queue> Fence<Queue>
+impl<Arr> Fence<Arr>
 where
-    Queue: AsRef<[FenceWaker]>,
+    Arr: AsMut<[FenceWaker]>,
 {
     /// Produces a handle to release the fence on drop.
-    pub fn wait<'a>(&'a self) -> FenceWaiter<'a>
+    pub fn wait<'a>(&'a self) -> FenceWaiter<'a, Arr>
     where
-        Queue: 'a,
+        Arr: 'a,
     {
         FenceWaiter {
+            state: FenceWaiterState::Uninitialized,
+            queue: &self.queue,
             finished: &self.finished,
-            state: FenceWaiterState::Uninitialized {
-                queue: self.queue.as_ref(),
-                queue_pos: &self.queue_pos,
-            },
         }
     }
 }
 
-impl Future for FenceWaiter<'_> {
+impl<Arr> Future for FenceWaiter<'_, Arr>
+where
+    Arr: AsMut<[FenceWaker]>,
+{
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.finished.load(Ordering::Acquire) {
-            Poll::Ready(())
-        } else {
+            return Poll::Ready(());
+        }
+
+        // If the try lock fails (aside from spurious failure), there are two
+        // likely scenarios:
+        // 1. The holder updated finished and is waking queues
+        // 2. Another waiter is inserting into the queue
+        //
+        // In either case, tossing this to the back of the async queue avoids
+        // busy-waiting and may end earlier.
+        if let Some(mut queue) = self.queue.try_lock_weak() {
             match self.state {
-                FenceWaiterState::Overcapacity => {
-                    cx.waker().wake_by_ref();
-                }
-                FenceWaiterState::Uninitialized { queue, queue_pos } => {
-                    // Implement pos + 1 logic without any overflow risks.
+                FenceWaiterState::Uninitialized => {
+                    // It is possible that finished was updated before the lock
+                    // was claimed, and this waker would never be notified of that.
+                    if self.finished.load(Ordering::Acquire) {
+                        return Poll::Ready(());
+                    }
+
+                    let FenceQueue { data, pos } = &mut *queue;
+                    let data = data.as_mut();
+
                     // Never fills the last element of a usize::MAX array.
                     // That is the cost of using a usize::MAX array.
-                    let resolved_pos = {
-                        let mut loaded_pos = queue_pos.load(Ordering::Acquire);
-                        while loaded_pos < queue.len()
-                            && queue_pos
-                                .compare_exchange(
-                                    loaded_pos,
-                                    loaded_pos + 1,
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                )
-                                .is_err()
-                        {
-                            loaded_pos += 1;
-                        }
-                        loaded_pos
-                    };
-
-                    self.state = if resolved_pos < queue.len() {
-                        // Initialize the waker with the current context
-                        let waker = &queue[resolved_pos];
-                        {
-                            let mut waker_lock = waker.lock();
-
-                            // Rollback the counter, avoid initializing, and
-                            // return early if finished.
-                            if self.finished.load(Ordering::Acquire) {
-                                // Correct the counter for the later `Fence` drop.
-                                let _ = queue_pos.fetch_sub(1, Ordering::Release);
-
-                                return Poll::Ready(());
-                            }
-
-                            *waker_lock = MaybeUninit::new(cx.waker().clone());
-                        }
-
-                        FenceWaiterState::Waiting { waker }
+                    if *pos < data.len() {
+                        data[*pos] = MaybeUninit::new(cx.waker().clone());
+                        self.state = FenceWaiterState::Waiting { queue_pos: *pos };
+                        *pos += 1;
                     } else {
                         cx.waker().wake_by_ref();
-                        FenceWaiterState::Overcapacity
-                    };
-                }
-                FenceWaiterState::Waiting { waker } => {
-                    if let Some(mut waker) = waker.try_lock() {
-                        let waker = waker.deref_mut();
-                        // The state MUST have been uninitialized first, and
-                        // then initialized the waker before going to this state
-                        let waker = unsafe { waker.assume_init_mut() };
-                        waker.clone_from(cx.waker());
-                    } else {
-                        // If the lock is being held, it is likely that
-                        // the holder is mid-drop and changed `finished`
-                        return self.poll(cx);
                     }
                 }
+                FenceWaiterState::Waiting { queue_pos } => {
+                    let waker = &mut queue.data.as_mut()[queue_pos];
+                    // This must have been in the uninitialized state earlier,
+                    // and then initialized its waker entry.
+                    let waker = unsafe { waker.assume_init_mut() };
+                    waker.clone_from(cx.waker());
+                }
             }
-
+            Poll::Pending
+        } else {
+            cx.waker().wake_by_ref();
             Poll::Pending
         }
     }
