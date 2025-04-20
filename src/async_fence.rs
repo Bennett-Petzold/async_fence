@@ -309,14 +309,17 @@ mod tests {
     use core::time::Duration;
 
     use futures::poll;
-    use tokio::{task::JoinSet, time::timeout};
+    use tokio::{
+        task::JoinSet,
+        time::{sleep, timeout},
+    };
 
     use super::*;
 
     const FENCE_LEN: usize = 3;
 
     #[tokio::test]
-    async fn waits_on_handle() {
+    async fn waits_on_holder() {
         static FENCE: StaticFence<FENCE_LEN> = StaticFence::new_arr();
 
         let holder = FENCE.hold();
@@ -359,6 +362,7 @@ mod tests {
                 if state == (FenceWaiterState::Waiting { queue_pos: idx }) {
                     break;
                 }
+                sleep(Duration::from_secs(1)).await;
             }
             assert_eq!(state, FenceWaiterState::Waiting { queue_pos: idx });
         }
@@ -388,5 +392,57 @@ mod tests {
         for handle in handles {
             assert_eq!(poll!(handle), Poll::Ready(()));
         }
+    }
+
+    #[tokio::test]
+    async fn excess_waiters() {
+        static FENCE: StaticFence<FENCE_LEN> = StaticFence::new_arr();
+
+        let holder = FENCE.hold();
+
+        let mut handles: [_; FENCE_LEN] = core::array::from_fn(|_| FENCE.wait());
+        let mut excess_handles: [_; FENCE_LEN * 10] = core::array::from_fn(|_| FENCE.wait());
+
+        // All handles enter Waiting
+        for (idx, mut handle) in handles.iter_mut().enumerate() {
+            assert_eq!(handle.state, FenceWaiterState::Uninitialized);
+
+            // Need to loop because of spurious failures
+            let mut state = handle.state;
+            for _ in 0..10 {
+                assert_eq!(poll!(&mut handle), Poll::Pending);
+                state = handle.state;
+                if state == (FenceWaiterState::Waiting { queue_pos: idx }) {
+                    break;
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+            assert_eq!(state, FenceWaiterState::Waiting { queue_pos: idx });
+        }
+
+        // All excess handles stay in uninitialized
+        for mut handle in &mut excess_handles {
+            assert_eq!(handle.state, FenceWaiterState::Uninitialized);
+
+            // Need to loop because of spurious failures
+            for _ in 0..10 {
+                assert_eq!(poll!(&mut handle), Poll::Pending);
+                assert_eq!(handle.state, FenceWaiterState::Uninitialized);
+            }
+        }
+
+        // After the holder is dropped, ALL the waiters finish.
+        drop(holder);
+
+        let mut all_handles = JoinSet::new();
+        for handle in handles.into_iter().chain(excess_handles) {
+            all_handles.spawn(handle);
+        }
+
+        assert!(
+            timeout(Duration::from_secs(1), all_handles.join_all())
+                .await
+                .is_ok()
+        );
     }
 }
