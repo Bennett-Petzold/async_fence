@@ -11,4 +11,8 @@ categories = ["no-std::no-alloc", "asynchronous"]
 keywords = ["fence", "once"]
 readme = "README.md"
 
+[features]
+alloc = []
+
 [dependencies]
+spin = "0.10"
