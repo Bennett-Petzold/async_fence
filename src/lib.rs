@@ -23,4 +23,5 @@ Contributions are welcome at
 <https://github.com/Bennett-Petzold/async_fence>.
 */
 
-pub mod async_fence;
+mod async_fence;
+pub use async_fence::*;

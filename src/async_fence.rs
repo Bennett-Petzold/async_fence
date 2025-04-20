@@ -21,7 +21,7 @@ extern crate alloc;
 pub type FenceWaker = MaybeUninit<Waker>;
 
 #[derive(Debug)]
-pub struct FenceQueue<Arr: AsMut<[FenceWaker]>> {
+struct FenceQueue<Arr: AsMut<[FenceWaker]>> {
     data: Arr,
     pos: usize,
 }
@@ -45,8 +45,31 @@ where
 /// dropped (released). Both types of handles borrow from the fence -- it acts
 /// as a context and must be kept alive for full fencing interaction.
 ///
-/// Use [`Self::new_arr_const`] for statically sized fences. Use
+/// Use [`Self::new_arr`] for statically sized fences. Use
 /// [`Self::default`] for dynamically sized fences.
+///
+/// # Example
+/// ```
+/// use async_fence::{StaticFence};
+///
+/// const FENCE_LEN: usize = 3;
+///
+/// // This fence will live for the entire program.
+/// static FENCE: StaticFence<FENCE_LEN> = StaticFence::new_arr();
+///
+/// let holder = FENCE.hold();
+///
+/// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+/// rt.block_on(async {
+///     let handles: [_; 3] = core::array::from_fn(|_| tokio::spawn(FENCE.wait()));
+///
+///     // After the holder is dropped, all the waiters finish.
+///     drop(holder);
+///     for handle in handles {
+///         handle.await;
+///     }
+/// });
+/// ```
 #[derive(Debug)]
 pub struct Fence<Arr: AsMut<[FenceWaker]>> {
     queue: SpinMutex<FenceQueue<Arr>>,
@@ -102,10 +125,13 @@ where
     }
 }
 
+/// A [`Fence`] based on a static array.
+///
+/// Initialize this with [`Self::new_arr`].
 pub type StaticFence<const N: usize> = Fence<[FenceWaker; N]>;
 
 impl<const N: usize> StaticFence<N> {
-    pub const fn new_arr_const() -> Self {
+    pub const fn new_arr() -> Self {
         // This works because:
         //  1. All of the elements are still marked MaybeUninit
         //  2. Arrays have no metadata: https://doc.rust-lang.org/reference/type-layout.html#r-layout.array
@@ -187,7 +213,7 @@ pub struct FenceWaiter<'a, Arr: AsMut<[FenceWaker]>> {
 }
 
 #[derive(Debug)]
-pub enum FenceWaiterState {
+enum FenceWaiterState {
     Uninitialized,
     Waiting { queue_pos: usize },
 }

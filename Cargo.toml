@@ -16,3 +16,6 @@ alloc = []
 
 [dependencies]
 spin = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread"] }
