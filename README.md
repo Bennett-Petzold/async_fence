@@ -20,6 +20,11 @@ and dynamic support.
 * [Embassy's OnceLock][EmbassyOnceLock]
     * Is blocking instead of async.
 
+## TODO
+* Support for smallvec
+* LazyLock implementation
+* OnceLock implementation
+
 [CrateStatus]: https://img.shields.io/crates/v/async_fence.svg
 [Crate]: https://crates.io/crates/async_fence
 [TestsStatus]: https://github.com/Bennett-Petzold/async_fence/actions/workflows/all-tests.yml/badge.svg?branch=main

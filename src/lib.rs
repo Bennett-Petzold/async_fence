@@ -25,3 +25,6 @@ Contributions are welcome at
 
 mod async_fence;
 pub use async_fence::*;
+
+#[cfg(feature = "alloc")]
+pub mod extending_arr;
