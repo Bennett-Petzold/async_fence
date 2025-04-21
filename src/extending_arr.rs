@@ -1,4 +1,4 @@
-use core::ops::RangeBounds;
+use core::{mem::MaybeUninit, ops::RangeBounds};
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -17,6 +17,13 @@ pub trait WakerArrExtending: Default + AsMut<[FenceWaker]> {
     fn reserve(&mut self, additional: usize);
     /// Same as [`alloc::vec::Vec::drain`].
     fn drain<R: RangeBounds<usize>>(&mut self, range: R) -> Self::DrainIter<'_>;
+
+    /// Creates `additional` uninitialized entries.
+    fn fill(&mut self, additional: usize) {
+        for _ in 0..additional {
+            self.push(MaybeUninit::uninit());
+        }
+    }
 }
 
 impl WakerArrExtending for Vec<FenceWaker> {
@@ -33,5 +40,9 @@ impl WakerArrExtending for Vec<FenceWaker> {
     }
     fn drain<R: RangeBounds<usize>>(&mut self, range: R) -> Self::DrainIter<'_> {
         Vec::drain(self, range)
+    }
+
+    fn fill(&mut self, additional: usize) {
+        self.extend(core::iter::from_fn(|| Some(MaybeUninit::uninit())).take(additional));
     }
 }

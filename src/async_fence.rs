@@ -437,7 +437,7 @@ where
 
 #[cfg(feature = "alloc")]
 /// [`FenceWaiter`] that extends the underlying collection.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct FenceWaiterExtending<'a, Arr: WakerArrExtending>(FenceWaiter<'a, Arr>);
 
@@ -500,6 +500,44 @@ where
     /// Executes [`WakerArrExtending::reserve`] on the waker array.
     pub fn reserve_storage(&self, additional: usize) {
         self.queue.lock().data.reserve(additional);
+    }
+
+    /// Executes [`WakerArrExtending::fill`] on the waker array.
+    ///
+    /// Can be used to ensure space before converting [`FenceWaiterExtending`]
+    /// to [`FenceWaiter`]. Both static and dynamically created waiters can
+    /// then be treated as a single type.
+    ///
+    /// # Example
+    /// ```
+    /// use async_fence::{Fence, FenceWaker};
+    ///
+    /// use std::{sync::LazyLock, vec::Vec};
+    ///
+    /// // This fence has dynamic storage and will live for the entire program.
+    /// static FENCE: LazyLock<Fence<Vec<FenceWaker>>> = LazyLock::new(Fence::default);
+    ///
+    /// let holder = FENCE.hold();
+    ///
+    /// // This preallocates for 3 non-dynamic wait entries.
+    /// FENCE.fill_storage(3);
+    ///
+    /// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    /// rt.block_on(async {
+    ///
+    ///     // The fence storage will not extend further, as this is a regular
+    ///     // wait handle.
+    ///     let handles: [_; 3] = core::array::from_fn(|_| tokio::spawn(FENCE.wait()));
+    ///
+    ///     // After the holder is dropped, all the waiters finish.
+    ///     drop(holder);
+    ///     for handle in handles {
+    ///         handle.await;
+    ///     }
+    /// });
+    /// ```
+    pub fn fill_storage(&self, additional: usize) {
+        self.queue.lock().data.fill(additional);
     }
 
     /// Produces a handle to wait for the fence to drop.
@@ -720,6 +758,50 @@ mod tests {
         let fence: Fence<Vec<_>> = Fence::default();
 
         let handles: [_; FENCE_LEN] = core::array::from_fn(|_| fence.wait_extending());
+
+        for (idx, mut handle) in handles.into_iter().enumerate() {
+            assert_eq!(handle.state, FenceWaiterState::Uninitialized);
+
+            // Need to loop because of spurious failures
+            let mut state = handle.state;
+            for _ in 0..100 {
+                assert_eq!(poll!(&mut handle), Poll::Pending);
+                state = handle.state;
+                if state == (FenceWaiterState::Waiting { queue_pos: idx }) {
+                    break;
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+            assert_eq!(state, FenceWaiterState::Waiting { queue_pos: idx });
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    #[tokio::test]
+    async fn extends_on_fill() {
+        use alloc::vec::Vec;
+
+        let fence: Fence<Vec<_>> = Fence::default();
+
+        let mut handles: [_; FENCE_LEN] = core::array::from_fn(|_| fence.wait());
+
+        // All non-reserved handles stay in uninitialized
+        for mut handle in &mut handles {
+            assert_eq!(handle.state, FenceWaiterState::Uninitialized);
+
+            // Need to loop because of spurious failures
+            for _ in 0..10 {
+                assert_eq!(poll!(&mut handle), Poll::Pending);
+                assert_eq!(handle.state, FenceWaiterState::Uninitialized);
+            }
+        }
+
+        assert_eq!(fence.usage(), 0);
+        assert_eq!(fence.capacity(), 0);
+
+        fence.fill_storage(3);
+        assert_eq!(fence.usage(), 0);
+        assert_eq!(fence.capacity(), 3);
 
         for (idx, mut handle) in handles.into_iter().enumerate() {
             assert_eq!(handle.state, FenceWaiterState::Uninitialized);
