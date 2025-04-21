@@ -16,10 +16,13 @@ pub trait WakerArrExtending: Default + AsMut<[FenceWaker]> {
     /// Same as [`alloc::vec::Vec::reserve`].
     fn reserve(&mut self, additional: usize);
     /// Same as [`alloc::vec::Vec::drain`].
+    ///
+    /// Held for future optimizations with generic specialization.
     fn drain<R: RangeBounds<usize>>(&mut self, range: R) -> Self::DrainIter<'_>;
 
     /// Creates `additional` uninitialized entries.
     fn fill(&mut self, additional: usize) {
+        self.reserve(additional);
         for _ in 0..additional {
             self.push(MaybeUninit::uninit());
         }
@@ -43,6 +46,6 @@ impl WakerArrExtending for Vec<FenceWaker> {
     }
 
     fn fill(&mut self, additional: usize) {
-        self.extend(core::iter::from_fn(|| Some(MaybeUninit::uninit())).take(additional));
+        self.extend(core::iter::repeat_with(MaybeUninit::uninit).take(additional));
     }
 }
