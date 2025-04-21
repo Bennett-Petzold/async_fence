@@ -27,7 +27,7 @@ extern crate alloc;
 
 pub type FenceWaker = MaybeUninit<Waker>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct FenceQueue<Arr: AsMut<[FenceWaker]>> {
     data: Arr,
     pos: usize,
@@ -154,6 +154,12 @@ where
 ///
 /// Initialize this with [`Self::new_arr`].
 pub type StaticFence<const N: usize> = Fence<[FenceWaker; N]>;
+
+#[cfg(feature = "alloc")]
+/// A [`Fence`] based on a [`Vec`][`alloc::vec::Vec`].
+///
+/// Initialize this with [`Self::default`].
+pub type VecFence = Fence<alloc::vec::Vec<FenceWaker>>;
 
 impl<const N: usize> StaticFence<N> {
     pub const fn new_arr() -> Self {
@@ -546,17 +552,17 @@ where
     ///
     /// # Example
     /// ```
-    /// use async_fence::{Fence, FenceWaker};
+    /// use async_fence::{Fence, FenceWaker, VecFence};
     ///
     /// use std::{sync::LazyLock, vec::Vec};
     ///
     /// // This fence has dynamic storage and will live for the entire program.
-    /// static FENCE: LazyLock<Fence<Vec<FenceWaker>>> = LazyLock::new(Fence::default);
+    /// static FENCE: LazyLock<VecFence> = LazyLock::new(Fence::default);
     ///
     /// // This is an alternative that executes const, and plays by the unsafe
     /// // rules. Const function cannot currently be set for a trait, so this
     /// // has to be done manually.
-    /// static UNSAFE_FENCE: Fence<Vec<FenceWaker>> = unsafe { Fence::new(Vec::new()) };
+    /// static UNSAFE_FENCE: VecFence = unsafe { Fence::new(Vec::new()) };
     ///
     /// let holder = FENCE.hold();
     ///
