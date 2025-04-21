@@ -7,6 +7,7 @@
 /*! Defines the core async wait for a waker. */
 
 use core::{
+    hash::Hash,
     mem::MaybeUninit,
     pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
@@ -156,8 +157,7 @@ impl<const N: usize> StaticFence<N> {
 /// Once the [`Fence`] is released, it cannot be re-enabled.
 #[derive(Debug, Clone)]
 pub struct FenceHolder<'a, Arr: AsMut<[FenceWaker]>> {
-    queue: &'a SpinMutex<FenceQueue<Arr>>,
-    finished: &'a AtomicBool,
+    source: &'a Fence<Arr>,
 }
 
 impl<Arr> Fence<Arr>
@@ -169,10 +169,46 @@ where
     where
         Arr: 'a,
     {
-        FenceHolder {
-            queue: &self.queue,
-            finished: &self.finished,
-        }
+        FenceHolder { source: self }
+    }
+}
+
+impl<Arr> PartialEq for FenceHolder<'_, Arr>
+where
+    Arr: AsMut<[FenceWaker]>,
+{
+    fn eq(&self, other: &Self) -> bool {
+        // The finished comparison can be skipped, as
+        core::ptr::eq(self.source as *const _, other.source as *const _)
+    }
+}
+
+impl<Arr> Eq for FenceHolder<'_, Arr> where Arr: AsMut<[FenceWaker]> {}
+
+impl<Arr> PartialOrd for FenceHolder<'_, Arr>
+where
+    Arr: AsMut<[FenceWaker]>,
+{
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<Arr> Ord for FenceHolder<'_, Arr>
+where
+    Arr: AsMut<[FenceWaker]>,
+{
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        (self.source as *const _ as usize).cmp(&(other.source as *const _ as usize))
+    }
+}
+
+impl<Arr> Hash for FenceHolder<'_, Arr>
+where
+    Arr: AsMut<[FenceWaker]>,
+{
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        state.write_usize(self.source as *const _ as usize);
     }
 }
 
@@ -181,10 +217,10 @@ where
     Arr: AsMut<[FenceWaker]>,
 {
     fn drop(&mut self) {
-        self.finished.store(true, Ordering::Release);
+        self.source.finished.store(true, Ordering::Release);
 
         // Cleans up any wakers left over by a fence holder
-        let mut queue = self.queue.lock();
+        let mut queue = self.source.queue.lock();
         if queue.pos > 0 {
             // Zeroing out the queue pointer makes any future FenceHolders skip
             let pos = core::mem::replace(&mut queue.pos, 0);
@@ -214,8 +250,50 @@ where
 #[derive(Debug)]
 pub struct FenceWaiter<'a, Arr: AsMut<[FenceWaker]>> {
     state: FenceWaiterState,
-    queue: &'a SpinMutex<FenceQueue<Arr>>,
-    finished: &'a AtomicBool,
+    source: &'a Fence<Arr>,
+}
+
+impl<Arr> PartialEq for FenceWaiter<'_, Arr>
+where
+    Arr: AsMut<[FenceWaker]>,
+{
+    fn eq(&self, other: &Self) -> bool {
+        // The finished comparison can be skipped, as
+        (core::ptr::eq(self.source as *const _, other.source as *const _))
+            && (self.state == other.state)
+    }
+}
+
+impl<Arr> Eq for FenceWaiter<'_, Arr> where Arr: AsMut<[FenceWaker]> {}
+
+impl<Arr> PartialOrd for FenceWaiter<'_, Arr>
+where
+    Arr: AsMut<[FenceWaker]>,
+{
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<Arr> Ord for FenceWaiter<'_, Arr>
+where
+    Arr: AsMut<[FenceWaker]>,
+{
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        (self.source as *const _ as usize)
+            .cmp(&(other.source as *const _ as usize))
+            .then(self.state.cmp(&other.state))
+    }
+}
+
+impl<Arr> Hash for FenceWaiter<'_, Arr>
+where
+    Arr: AsMut<[FenceWaker]>,
+{
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        state.write_usize(self.source as *const _ as usize);
+        self.state.hash(state);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -231,8 +309,7 @@ where
     fn clone(&self) -> Self {
         Self {
             state: FenceWaiterState::Uninitialized,
-            queue: self.queue,
-            finished: self.finished,
+            source: self.source,
         }
     }
 }
@@ -248,8 +325,7 @@ where
     {
         FenceWaiter {
             state: FenceWaiterState::Uninitialized,
-            queue: &self.queue,
-            finished: &self.finished,
+            source: &self,
         }
     }
 }
@@ -264,7 +340,7 @@ where
     Arr: AsMut<[FenceWaker]>,
     F: FnOnce(&mut FenceWaiterState, &mut FenceQueue<Arr>, &mut Context<'_>),
 {
-    if this.finished.load(Ordering::Acquire) {
+    if this.source.finished.load(Ordering::Acquire) {
         return Poll::Ready(());
     }
 
@@ -275,12 +351,12 @@ where
     //
     // In either case, tossing this to the back of the async queue avoids
     // busy-waiting and may end earlier.
-    if let Some(mut queue) = this.queue.try_lock_weak() {
+    if let Some(mut queue) = this.source.queue.try_lock_weak() {
         match this.state {
             FenceWaiterState::Uninitialized => {
                 // It is possible that finished was updated before the lock
                 // was claimed, and this waker would never be notified of that.
-                if this.finished.load(Ordering::Acquire) {
+                if this.source.finished.load(Ordering::Acquire) {
                     return Poll::Ready(());
                 }
 
