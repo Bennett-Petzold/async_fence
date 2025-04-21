@@ -97,6 +97,24 @@ where
             finished: AtomicBool::new(false),
         }
     }
+
+    /// Returns if the fence has been released.
+    pub fn finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    /// Returns the underlying capacity.
+    pub fn capacity(&self) -> usize {
+        self.queue.lock().data.as_mut().len()
+    }
+
+    /// Returns the claimed capacity.
+    ///
+    /// The number of waiters may exceed this if they haven't all claimed an
+    /// entry yet.
+    pub fn usage(&self) -> usize {
+        self.queue.lock().pos
+    }
 }
 
 impl<Arr> Drop for Fence<Arr>
@@ -170,6 +188,15 @@ where
         Arr: 'a,
     {
         FenceHolder { source: self }
+    }
+}
+
+impl<Arr> FenceHolder<'_, Arr>
+where
+    Arr: AsMut<[FenceWaker]>,
+{
+    pub const fn source(&self) -> &Fence<Arr> {
+        self.source
     }
 }
 
@@ -253,6 +280,15 @@ pub struct FenceWaiter<'a, Arr: AsMut<[FenceWaker]>> {
     source: &'a Fence<Arr>,
 }
 
+impl<Arr> FenceWaiter<'_, Arr>
+where
+    Arr: AsMut<[FenceWaker]>,
+{
+    pub const fn source(&self) -> &Fence<Arr> {
+        self.source
+    }
+}
+
 impl<Arr> PartialEq for FenceWaiter<'_, Arr>
 where
     Arr: AsMut<[FenceWaker]>,
@@ -325,7 +361,7 @@ where
     {
         FenceWaiter {
             state: FenceWaiterState::Uninitialized,
-            source: &self,
+            source: self,
         }
     }
 }
