@@ -28,3 +28,6 @@ pub use async_fence::*;
 
 #[cfg(feature = "alloc")]
 pub mod extending_arr;
+
+#[cfg(feature = "once")]
+pub mod once;
