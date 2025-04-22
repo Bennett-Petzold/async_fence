@@ -1,10 +1,15 @@
 use core::{
     cell::UnsafeCell,
+    marker::PhantomData,
     mem::MaybeUninit,
+    pin::{Pin, pin},
     sync::atomic::{AtomicBool, Ordering, fence},
+    task::{Context, Poll, ready},
 };
 
-use crate::{Fence, FenceWaker};
+use pin_project_lite::pin_project;
+
+use crate::{Fence, FenceHolder, FenceWaiter, FenceWaker};
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -73,6 +78,7 @@ where
     }
 }
 
+// ---------- Sync functions ---------- //
 impl<T, Arr> OnceLock<T, Arr>
 where
     Arr: AsMut<[FenceWaker]>,
@@ -114,38 +120,12 @@ where
         }
     }
 
-    pub const fn get_mut_or_init<F>(&mut self, fut: F) -> Option<&mut T>
-    where
-        F: Future<Output = T>,
-    {
-        todo!()
-    }
-
-    pub const fn get_mut_or_try_init<F, E>(&mut self, fut: F) -> Option<&mut T>
-    where
-        F: Future<Output = Result<T, E>>,
-    {
-        todo!()
-    }
-
-    pub const fn get_or_init<F>(&self, fut: F) -> Option<&T>
-    where
-        F: Future<Output = T>,
-    {
-        todo!()
-    }
-
-    pub const fn get_or_try_init<F, E>(&self, fut: F) -> Option<&T>
-    where
-        F: Future<Output = Result<T, E>>,
-    {
-        todo!()
+    fn prior_holder(&self) -> bool {
+        self.holder_exists.swap(true, Ordering::AcqRel)
     }
 
     pub fn set(&self, value: T) -> Result<(), T> {
-        let existing_holder = self.holder_exists.swap(true, Ordering::AcqRel);
-
-        if !existing_holder {
+        if !self.prior_holder() {
             // existing_holder guards so that this is the only access.
             *unsafe { &mut *self.data.get() } = MaybeUninit::new(value);
 
@@ -159,9 +139,7 @@ where
     }
 
     pub fn try_insert<F>(&self, value: T) -> Result<&T, (&T, T)> {
-        let existing_holder = self.holder_exists.swap(true, Ordering::AcqRel);
-
-        if !existing_holder {
+        if !self.prior_holder() {
             // existing_holder guards so that this is the only access.
             *unsafe { &mut *self.data.get() } = MaybeUninit::new(value);
 
@@ -174,14 +152,10 @@ where
         } else {
             // Memory fencing ensures this got the initialized data change
             fence(Ordering::Acquire);
-            let exisiting = unsafe { (&*self.data.get()).assume_init_ref() };
+            let exisiting = unsafe { (*self.data.get()).assume_init_ref() };
 
             Err((exisiting, value))
         }
-    }
-
-    pub const fn wait<F>(&self, value: T) -> Option<&T> {
-        todo!()
     }
 }
 
@@ -216,6 +190,147 @@ where
             Some(unsafe { data.assume_init() })
         } else {
             None
+        }
+    }
+}
+
+// ---------- Async functions ---------- //
+
+#[derive(Debug)]
+pub struct OnceLockWait<'a, T, Arr: AsMut<[FenceWaker]>> {
+    handle: FenceWaiter<'a, Arr>,
+    data: &'a UnsafeCell<MaybeUninit<T>>,
+}
+
+impl<'a, T, Arr> Future for OnceLockWait<'a, T, Arr>
+where
+    Arr: AsMut<[FenceWaker]>,
+{
+    type Output = &'a T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        // Waiter must complete before a result is ready/valid
+        ready!(pin!(&mut this.handle).poll(cx));
+
+        // Ordering ensures initialized data is synced
+        fence(Ordering::Acquire);
+        let data = unsafe { (*this.data.get()).assume_init_ref() };
+        Poll::Ready(data)
+    }
+}
+
+pin_project! {
+    #[derive(Debug)]
+    pub struct OnceLockSet<'a, T, Arr: AsMut<[FenceWaker]>, F: Future<Output = T>> {
+        handle: FenceHolder<'a, Arr>,
+        data: &'a UnsafeCell<MaybeUninit<T>>,
+        #[pin]
+        fut: F,
+    }
+}
+
+impl<'a, T, Arr, F> Future for OnceLockSet<'a, T, Arr, F>
+where
+    Arr: AsMut<[FenceWaker]>,
+    F: Future<Output = T>,
+{
+    type Output = &'a T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+
+        // Waiter must complete before a result is ready/valid
+        let init_data = ready!(this.fut.poll(cx));
+        // Guaranteed unique access
+        let data = unsafe { &mut *this.data.get() };
+        *data = MaybeUninit::new(init_data);
+
+        // Ordering ensures initialized data is synced
+        fence(Ordering::Release);
+        this.handle.release();
+
+        // Previously initialized
+        Poll::Ready(unsafe { data.assume_init_ref() })
+    }
+}
+
+pin_project! {
+    #[project = OnceLockInitProj]
+    #[derive(Debug)]
+    pub enum OnceLockInit<'a, T, Arr: AsMut<[FenceWaker]>, F: Future<Output = T>> {
+        Set{#[pin] set: OnceLockSet<'a, T, Arr, F>},
+        Wait{wait: OnceLockWait<'a, T, Arr>},
+    }
+}
+
+impl<'a, T, Arr, F> Future for OnceLockInit<'a, T, Arr, F>
+where
+    Arr: AsMut<[FenceWaker]>,
+    F: Future<Output = T>,
+{
+    type Output = &'a T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.project() {
+            OnceLockInitProj::Set { set } => set.poll(cx),
+            OnceLockInitProj::Wait { wait } => pin!(wait).poll(cx),
+        }
+    }
+}
+
+impl<T, Arr> OnceLock<T, Arr>
+where
+    Arr: AsMut<[FenceWaker]>,
+{
+    pub fn get_or_init<F>(&self, fut: F) -> OnceLockInit<'_, T, Arr, F>
+    where
+        F: Future<Output = T>,
+    {
+        if self.prior_holder() {
+            OnceLockInit::Wait {
+                wait: OnceLockWait {
+                    handle: self.fence.wait(),
+                    data: &self.data,
+                },
+            }
+        } else {
+            OnceLockInit::Set {
+                set: OnceLockSet {
+                    handle: self.fence.hold(),
+                    data: &self.data,
+                    fut,
+                },
+            }
+        }
+    }
+
+    pub fn get_or_try_init<F, E>(&self, fut: F) -> Option<&T>
+    where
+        F: Future<Output = Result<T, E>>,
+    {
+        todo!()
+    }
+
+    pub fn get_mut_or_init<F>(&mut self, fut: F) -> Option<&mut T>
+    where
+        F: Future<Output = T>,
+    {
+        todo!()
+    }
+
+    pub fn get_mut_or_try_init<F, E>(&mut self, fut: F) -> Option<&mut T>
+    where
+        F: Future<Output = Result<T, E>>,
+    {
+        todo!()
+    }
+
+    pub fn wait(&self) -> OnceLockWait<'_, T, Arr> {
+        OnceLockWait {
+            handle: self.fence.wait(),
+            data: &self.data,
         }
     }
 }

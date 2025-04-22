@@ -13,9 +13,10 @@ readme = "README.md"
 
 [features]
 alloc = []
-once = []
+once = ["dep:pin-project-lite"]
 
 [dependencies]
+pin-project-lite = { version = "0.2", optional = true }
 spin = "0.10"
 
 [dev-dependencies]

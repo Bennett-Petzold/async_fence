@@ -245,11 +245,12 @@ where
     }
 }
 
-impl<Arr> Drop for FenceHolder<'_, Arr>
+impl<Arr> FenceHolder<'_, Arr>
 where
     Arr: AsMut<[FenceWaker]>,
 {
-    fn drop(&mut self) {
+    /// Allows for calling [`Drop`] without destroying the holder.
+    pub fn release(&self) {
         self.source.finished.store(true, Ordering::Release);
 
         // Cleans up any wakers left over by a fence holder
@@ -266,6 +267,15 @@ where
                 local_entry.wake();
             }
         }
+    }
+}
+
+impl<Arr> Drop for FenceHolder<'_, Arr>
+where
+    Arr: AsMut<[FenceWaker]>,
+{
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
