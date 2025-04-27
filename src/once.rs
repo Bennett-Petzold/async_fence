@@ -1,6 +1,5 @@
 use core::{
     cell::UnsafeCell,
-    marker::PhantomData,
     mem::MaybeUninit,
     pin::{Pin, pin},
     sync::atomic::{AtomicBool, Ordering, fence},
@@ -148,7 +147,7 @@ where
             drop(self.fence.hold());
 
             // Guaranteed by prior operations
-            Ok(unsafe { (&*self.data.get()).assume_init_ref() })
+            Ok(unsafe { (*self.data.get()).assume_init_ref() })
         } else {
             // Memory fencing ensures this got the initialized data change
             fence(Ordering::Acquire);
@@ -306,31 +305,49 @@ where
         }
     }
 
-    pub fn get_or_try_init<F, E>(&self, fut: F) -> Option<&T>
-    where
-        F: Future<Output = Result<T, E>>,
-    {
-        todo!()
-    }
-
-    pub fn get_mut_or_init<F>(&mut self, fut: F) -> Option<&mut T>
-    where
-        F: Future<Output = T>,
-    {
-        todo!()
-    }
-
-    pub fn get_mut_or_try_init<F, E>(&mut self, fut: F) -> Option<&mut T>
-    where
-        F: Future<Output = Result<T, E>>,
-    {
-        todo!()
-    }
-
     pub fn wait(&self) -> OnceLockWait<'_, T, Arr> {
         OnceLockWait {
             handle: self.fence.wait(),
             data: &self.data,
+        }
+    }
+}
+
+pin_project! {
+    #[derive(Debug)]
+    pub struct OnceLockTrySet<'a, T, E, Arr: AsMut<[FenceWaker]>, F: Future<Output = Result<T, E>>> {
+        handle: FenceHolder<'a, Arr>,
+        data: &'a UnsafeCell<MaybeUninit<T>>,
+        #[pin]
+        fut: F,
+    }
+}
+
+impl<'a, T, E, Arr, F> Future for OnceLockTrySet<'a, T, E, Arr, F>
+where
+    Arr: AsMut<[FenceWaker]>,
+    F: Future<Output = Result<T, E>>,
+{
+    type Output = Result<&'a T, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+
+        // Waiter must complete before a result is ready/valid
+        match ready!(this.fut.poll(cx)) {
+            Ok(init_data) => {
+                // Guaranteed unique access
+                let data = unsafe { &mut *this.data.get() };
+                *data = MaybeUninit::new(init_data);
+
+                // Ordering ensures initialized data is synced
+                fence(Ordering::Release);
+                this.handle.release();
+
+                // Previously initialized
+                Poll::Ready(Ok(unsafe { data.assume_init_ref() }))
+            }
+            Err(init_err) => Poll::Ready(Err(init_err)),
         }
     }
 }
