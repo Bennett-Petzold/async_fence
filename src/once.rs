@@ -208,7 +208,7 @@ where
     /// On success, a reference to the set value is returned.
     /// On failure, the already-set value and the unset value are returned
     /// (ALREADY_SET, value).
-    pub fn try_insert<F>(&self, value: T) -> Result<&T, (&T, T)> {
+    pub fn try_insert(&self, value: T) -> Result<&T, (&T, T)> {
         if !self.prior_holder() {
             // existing_holder guards so that this is the only access.
             *unsafe { &mut *self.data.get() } = MaybeUninit::new(value);
@@ -418,5 +418,83 @@ where
             handle: self.fence.wait(),
             data: &self.data,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::future::ready;
+
+    use futures::poll;
+
+    use super::*;
+
+    const FENCE_LEN: usize = 2;
+    type TestLock = StaticOnceLock<bool, FENCE_LEN>;
+
+    #[test]
+    fn only_sets_once() {
+        let mut lock: TestLock = StaticOnceLock::new_arr();
+
+        assert_eq!(lock.get(), None);
+        assert_eq!(lock.get_mut(), None);
+        assert_eq!(lock.set(true), Ok(()));
+        assert_eq!(lock.get(), Some(&true));
+        assert_eq!(lock.get_mut(), Some(&mut true));
+
+        assert_eq!(lock.set(false), Err(false));
+        assert_eq!(lock.into_inner(), Some(true));
+    }
+
+    #[test]
+    fn try_insert_once() {
+        static LOCK: TestLock = StaticOnceLock::new_arr();
+
+        assert_eq!(LOCK.try_insert(true), Ok(&true));
+        assert_eq!(LOCK.try_insert(false), Err((&true, false)));
+        assert_eq!(LOCK.try_insert(true), Err((&true, true)));
+    }
+
+    #[test]
+    fn resets_arr() {
+        let mut lock: TestLock = StaticOnceLock::new_arr();
+
+        assert_eq!(lock.set(true), Ok(()));
+        assert_eq!(lock.take_arr(), Some(true));
+        assert_eq!(lock.get(), None);
+        assert_eq!(lock.set(false), Ok(()));
+        assert_eq!(lock.get(), Some(&false));
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn resets_dyn() {
+        let mut lock: VecOnceLock<_> = VecOnceLock::default();
+
+        assert_eq!(lock.set(true), Ok(()));
+        assert_eq!(lock.take_extending(), Some(true));
+        assert_eq!(lock.get(), None);
+        assert_eq!(lock.set(false), Ok(()));
+        assert_eq!(lock.get(), Some(&false));
+    }
+
+    #[tokio::test]
+    async fn waits_to_init() {
+        static LOCK: TestLock = StaticOnceLock::new_arr();
+
+        let init = LOCK.get_or_init(ready(true));
+        assert!(matches!(init, OnceLockInit::Set { .. }));
+        assert_eq!(LOCK.get(), None);
+
+        let mut wait_0 = LOCK.get_or_init(ready(false));
+        assert!(matches!(wait_0, OnceLockInit::Wait { .. }));
+        assert_eq!(poll!(&mut wait_0), Poll::Pending);
+
+        let mut wait_1 = LOCK.wait();
+        assert_eq!(poll!(&mut wait_1), Poll::Pending);
+
+        assert_eq!(init.await, &true);
+        assert_eq!(wait_0.await, &true);
+        assert_eq!(wait_1.await, &true);
     }
 }

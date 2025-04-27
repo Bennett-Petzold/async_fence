@@ -31,3 +31,7 @@ pub mod extending_arr;
 
 #[cfg(feature = "once")]
 pub mod once;
+#[cfg(all(feature = "once", feature = "alloc"))]
+pub use once::VecOnceLock;
+#[cfg(feature = "once")]
+pub use once::{OnceLock, StaticOnceLock};
