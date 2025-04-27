@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"mod":["extending_arr"],"struct":["Fence","FenceHolder","FenceWaiter","FenceWaiterExtending"],"type":["FenceWaker","StaticFence"]};
+window.SIDEBAR_ITEMS = {"mod":["core","extending_arr","lazy","once"]};

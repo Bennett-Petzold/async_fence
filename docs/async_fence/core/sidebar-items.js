@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["Fence","FenceWaiter","FenceWaiterExtending"],"type":["FenceWaker","StaticFence","VecFence"]};

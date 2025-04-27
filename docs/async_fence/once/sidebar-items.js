@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["OnceLockInit"],"struct":["OnceLock","OnceLockSet","OnceLockWait"],"type":["StaticOnceLock","VecOnceLock"]};
