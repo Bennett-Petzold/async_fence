@@ -1,6 +1,7 @@
 use core::{
     cell::UnsafeCell,
     mem::MaybeUninit,
+    panic::RefUnwindSafe,
     pin::{Pin, pin},
     sync::atomic::{AtomicBool, Ordering, fence},
     task::{Context, Poll, ready},
@@ -23,8 +24,37 @@ pub struct OnceLock<T, Arr: AsMut<[FenceWaker]>> {
     holder_exists: AtomicBool,
 }
 
+/// Standard removal of the !Send forced by [`UnsafeCell`].
+unsafe impl<T, Arr: AsMut<[FenceWaker]>> Send for OnceLock<T, Arr> where T: Send {}
 /// Standard removal of the !Sync forced by [`UnsafeCell`].
 unsafe impl<T, Arr: AsMut<[FenceWaker]>> Sync for OnceLock<T, Arr> where T: Send + Sync {}
+
+impl<T, Arr: AsMut<[FenceWaker]>> RefUnwindSafe for OnceLock<T, Arr> {}
+
+impl<T, Arr: AsMut<[FenceWaker]>> Drop for OnceLock<T, Arr> {
+    fn drop(&mut self) {
+        if self.holder_exists.load(Ordering::Acquire) && self.fence.finished() {
+            // Memory ordering assures the single write to data is complete
+            fence(Ordering::Acquire);
+
+            let mut data = MaybeUninit::uninit();
+            core::mem::swap(self.data.get_mut(), &mut data);
+
+            // Finished indicates initialized
+            let data = unsafe { data.assume_init() };
+            // Make sure initialized data has destructor calls
+            drop(data);
+        }
+    }
+}
+
+impl<T: PartialEq, Arr: AsMut<[FenceWaker]>> PartialEq for OnceLock<T, Arr> {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl<T: Eq, Arr: AsMut<[FenceWaker]>> Eq for OnceLock<T, Arr> {}
 
 impl<T, Arr> OnceLock<T, Arr>
 where
@@ -107,13 +137,19 @@ where
         }
     }
 
-    pub fn into_inner(self) -> Option<T> {
+    pub fn into_inner(mut self) -> Option<T> {
         if self.fence.finished() {
             // Memory ordering assures the single write to data is complete
             fence(Ordering::Acquire);
 
+            // This type has Drop, so the data needs to be swapped out
+            let mut data = MaybeUninit::uninit();
+            core::mem::swap(self.data.get_mut(), &mut data);
+            // Avoid calling the destructor on uninitialized data
+            self.holder_exists.store(false, Ordering::Release);
+
             // Finished indicates initialized
-            Some(unsafe { self.data.into_inner().assume_init() })
+            Some(unsafe { data.assume_init() })
         } else {
             None
         }
