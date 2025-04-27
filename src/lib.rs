@@ -38,11 +38,7 @@ pub use once::VecOnceLock;
 #[cfg(feature = "once")]
 pub use once::{OnceLock, StaticOnceLock};
 
-/*
 #[cfg(feature = "lazy")]
 pub mod lazy;
 #[cfg(feature = "lazy")]
 pub use lazy::LazyLock;
-#[cfg(all(feature = "lazy", feature = "alloc"))]
-pub use lazy::{DynLazyLock, VecLazyLock};
-*/

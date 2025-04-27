@@ -21,7 +21,8 @@ extern crate alloc;
 /// Use [`Self::default`] for dynamic backings.
 ///
 /// Produces futures that either set or wait for another future to set the
-/// value. The methods never block. [`Self::get_or_init`] is the main method.
+/// value. The methods never block. Waiting futures will, however, not pick up
+/// initialization when it is dropped.
 ///
 /// # Example
 /// ```

@@ -14,6 +14,7 @@ readme = "README.md"
 [features]
 alloc = []
 once = ["dep:pin-project-lite"]
+lazy = ["once"]
 
 [dependencies]
 pin-project-lite = { version = "0.2", optional = true }
