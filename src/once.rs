@@ -9,7 +9,7 @@ use core::{
 
 use pin_project_lite::pin_project;
 
-use crate::{Fence, FenceWaiter, FenceWaker};
+use crate::core::{Fence, FenceWaiter, FenceWaker};
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -310,12 +310,26 @@ where
 
 pin_project! {
     /// Initializes [`OnceLock`] with the given future, returning the value.
+    ///
+    /// If dropped mid-initialization, any following code can claim
+    /// initialization. Pure waiters prior to the drop will not attempt to init.
     #[derive(Debug)]
     pub struct OnceLockSet<'a, T, Arr: AsMut<[FenceWaker]>, F: Future<Output = T>> {
-        handle: &'a Fence<Arr>,
-        data: &'a UnsafeCell<MaybeUninit<T>>,
+        lock: &'a OnceLock<T, Arr>,
         #[pin]
         fut: F,
+    }
+
+    impl<'a, T, Arr, F> PinnedDrop for OnceLockSet<'a, T, Arr, F>
+    where
+        Arr: AsMut<[FenceWaker]>,
+        F: Future<Output = T>,
+    {
+        fn drop(this: Pin<&mut Self>) {
+            if !this.lock.fence.finished() {
+                this.lock.holder_exists.store(false, Ordering::Release);
+            }
+        }
     }
 }
 
@@ -343,12 +357,12 @@ where
         // Waiter must complete before a result is ready/valid
         let init_data = ready!(this.fut.poll(cx));
         // Guaranteed unique access
-        let data = unsafe { &mut *this.data.get() };
+        let data = unsafe { &mut *this.lock.data.get() };
         *data = MaybeUninit::new(init_data);
 
         // Ordering ensures initialized data is synced
         fence(Ordering::Release);
-        this.handle.release();
+        this.lock.fence.release();
 
         // Previously initialized
         Poll::Ready(unsafe { data.assume_init_ref() })
@@ -359,11 +373,15 @@ pin_project! {
     /// Either initializes the [`OnceLock`] or waits for another initializer.
     ///
     /// In either case, this returns the value once it has been initialized.
+    ///
+    /// If the [`Self::Set`] is dropped before initializing, another
+    /// [`Self::Set`] can be created. The existing [`Self::Wait`] will not
+    /// claim initialization, they will just wait.
     #[project = OnceLockInitProj]
     #[derive(Debug)]
     pub enum OnceLockInit<'a, T, Arr: AsMut<[FenceWaker]>, F: Future<Output = T>> {
-        Set{#[pin] set: OnceLockSet<'a, T, Arr, F>},
-        Wait{wait: OnceLockWait<'a, T, Arr>},
+        Set{ #[pin] set: OnceLockSet<'a, T, Arr, F> },
+        Wait{ wait: OnceLockWait<'a, T, Arr> },
     }
 }
 
@@ -390,6 +408,10 @@ where
     ///
     /// If the value is uninitialized, and not currently being initialized,
     /// `fut` will be used to initialize it.
+    ///
+    /// If the initializer is dropped, the next call will produce a new
+    /// initializer. Other initializing methods will also apply. No existing
+    /// waiters will switch to initializers, they will just wait.
     pub fn get_or_init<F>(&self, fut: F) -> OnceLockInit<'_, T, Arr, F>
     where
         F: Future<Output = T>,
@@ -403,11 +425,7 @@ where
             }
         } else {
             OnceLockInit::Set {
-                set: OnceLockSet {
-                    handle: &self.fence,
-                    data: &self.data,
-                    fut,
-                },
+                set: OnceLockSet { lock: self, fut },
             }
         }
     }
@@ -496,8 +514,36 @@ mod tests {
         let mut wait_1 = LOCK.wait();
         assert_eq!(poll!(&mut wait_1), Poll::Pending);
 
-        assert_eq!(init.await, &true);
-        assert_eq!(wait_0.await, &true);
-        assert_eq!(wait_1.await, &true);
+        assert_eq!(poll!(init), Poll::Ready(&true));
+        assert_eq!(poll!(wait_0), Poll::Ready(&true));
+        assert_eq!(poll!(wait_1), Poll::Ready(&true));
+    }
+
+    #[tokio::test]
+    async fn dropped_init() {
+        static LOCK: TestLock = StaticOnceLock::new_arr();
+
+        let init = LOCK.get_or_init(ready(true));
+        assert!(matches!(init, OnceLockInit::Set { .. }));
+        assert_eq!(LOCK.get(), None);
+
+        let mut wait_0 = LOCK.get_or_init(ready(false));
+        assert!(matches!(wait_0, OnceLockInit::Wait { .. }));
+        assert_eq!(poll!(&mut wait_0), Poll::Pending);
+
+        let mut wait_1 = LOCK.wait();
+        assert_eq!(poll!(&mut wait_1), Poll::Pending);
+
+        // Dropping the initializer prevents waits from finishing.
+        drop(init);
+        assert_eq!(poll!(&mut wait_0), Poll::Pending);
+        assert_eq!(poll!(&mut wait_1), Poll::Pending);
+
+        // A later new initializer is applied instead of the dropped one.
+        let new_init = LOCK.get_or_init(ready(false));
+        assert!(matches!(new_init, OnceLockInit::Set { .. }));
+        assert_eq!(poll!(new_init), Poll::Ready(&false));
+        assert_eq!(poll!(wait_0), Poll::Ready(&false));
+        assert_eq!(poll!(wait_1), Poll::Ready(&false));
     }
 }

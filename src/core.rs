@@ -445,12 +445,12 @@ where
     ///
     /// # Example
     /// ```
-    /// use async_fence::{Fence, FenceWaker};
+    /// use async_fence::core::{Fence, FenceWaker};
     ///
-    /// use std::{sync::LazyLock, vec::Vec};
+    /// use std::{sync::LazyLock as StdLazyLock, vec::Vec};
     ///
     /// // This fence has dynamic storage and will live for the entire program.
-    /// static FENCE: LazyLock<Fence<Vec<FenceWaker>>> = LazyLock::new(Fence::default);
+    /// static FENCE: StdLazyLock<Fence<Vec<FenceWaker>>> = StdLazyLock::new(Fence::default);
     ///
     /// // This preallocates for 3 non-dynamic wait entries.
     /// FENCE.fill_storage(3);
@@ -478,7 +478,7 @@ where
     ///
     /// # Example
     /// ```
-    /// use async_fence::{Fence, FenceWaker, VecFence};
+    /// use async_fence::{Fence, VecFence};
     ///
     /// use std::{sync::LazyLock, vec::Vec};
     ///
