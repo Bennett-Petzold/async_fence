@@ -14,6 +14,29 @@ use crate::{Fence, FenceHolder, FenceWaiter, FenceWaker};
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+/// Async equivalent of
+/// [`std::sync::OnceLock`](<https://doc.rust-lang.org/stable/std/sync/struct.OnceLock.html>).
+///
+/// Produces futures that either set or wait for another future to set the
+/// value. The methods never block. [`Self::get_or_init`] is the main method.
+///
+/// # Example
+/// ```
+/// use async_fence::once::StaticOnceLock;
+///
+/// const FENCE_LEN: usize = 1;
+///
+/// static LOCK: StaticOnceLock<bool, FENCE_LEN> = StaticOnceLock::new_arr();
+///
+/// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+/// rt.block_on(async {
+///     let regular = tokio::spawn(LOCK.get_or_init(async { true }));
+///     let opposite = tokio::spawn(LOCK.get_or_init(async { false }));
+///
+///     // Only one of the initializers runs, and the other shares its value.
+///     assert_eq!(regular.await.unwrap(), opposite.await.unwrap());
+/// });
+/// ```
 #[derive(Debug)]
 pub struct OnceLock<T, Arr: AsMut<[FenceWaker]>> {
     data: UnsafeCell<MaybeUninit<T>>,
@@ -112,6 +135,7 @@ impl<T, Arr> OnceLock<T, Arr>
 where
     Arr: AsMut<[FenceWaker]>,
 {
+    /// Returns a reference to the underlying value if initialized.
     pub fn get(&self) -> Option<&T> {
         if self.fence.finished() {
             // Memory ordering assures the single write to data is complete
@@ -125,6 +149,7 @@ where
         }
     }
 
+    /// Returns a mutable reference to the underlying value if initialized.
     pub fn get_mut(&mut self) -> Option<&mut T> {
         if self.fence.finished() {
             // Memory ordering assures the single write to data is complete
@@ -137,6 +162,7 @@ where
         }
     }
 
+    /// Returns the underlying value if initialized.
     pub fn into_inner(mut self) -> Option<T> {
         if self.fence.finished() {
             // Memory ordering assures the single write to data is complete
@@ -155,10 +181,14 @@ where
         }
     }
 
+    /// Internal method for only one call to claim initialization.
     fn prior_holder(&self) -> bool {
         self.holder_exists.swap(true, Ordering::AcqRel)
     }
 
+    /// Immediately sets the internal value if uninitialized.
+    ///
+    /// On failure, the unset value is returned.
     pub fn set(&self, value: T) -> Result<(), T> {
         if !self.prior_holder() {
             // existing_holder guards so that this is the only access.
@@ -173,6 +203,11 @@ where
         }
     }
 
+    /// Tries to immediately set and return the internal value if uninitialized.
+    ///
+    /// On success, a reference to the set value is returned.
+    /// On failure, the already-set value and the unset value are returned
+    /// (ALREADY_SET, value).
     pub fn try_insert<F>(&self, value: T) -> Result<&T, (&T, T)> {
         if !self.prior_holder() {
             // existing_holder guards so that this is the only access.
@@ -195,12 +230,16 @@ where
 }
 
 impl<T, const N: usize> StaticOnceLock<T, N> {
+    /// Returns the underlying value if initialized, resetting to default.
+    ///
+    /// Only works on static backing arrays.
     pub fn take_arr(&mut self) -> Option<T> {
         if self.fence.finished() {
             // Memory ordering assures the single write to data is complete
             fence(Ordering::Acquire);
 
             self.fence = Fence::new_arr();
+            self.holder_exists.store(false, Ordering::Release);
             let data = core::mem::replace(self.data.get_mut(), MaybeUninit::uninit());
             // Finished indicates initialized
             Some(unsafe { data.assume_init() })
@@ -214,12 +253,16 @@ impl<T, Arr> OnceLock<T, Arr>
 where
     Arr: AsMut<[FenceWaker]> + Default,
 {
+    /// Returns the underlying value if initialized, resetting to default.
+    ///
+    /// Only works on dynamic backing arrays.
     pub fn take_extending(&mut self) -> Option<T> {
         if self.fence.finished() {
             // Memory ordering assures the single write to data is complete
             fence(Ordering::Acquire);
 
             self.fence = Fence::default();
+            self.holder_exists.store(false, Ordering::Release);
             let data = core::mem::replace(self.data.get_mut(), MaybeUninit::uninit());
             // Finished indicates initialized
             Some(unsafe { data.assume_init() })
@@ -231,11 +274,17 @@ where
 
 // ---------- Async functions ---------- //
 
+/// Finishes with `Some(T)` on [`OnceLock`] initialization.
 #[derive(Debug)]
 pub struct OnceLockWait<'a, T, Arr: AsMut<[FenceWaker]>> {
     handle: FenceWaiter<'a, Arr>,
     data: &'a UnsafeCell<MaybeUninit<T>>,
 }
+
+/// Standard removal of the !Send forced by [`UnsafeCell`].
+unsafe impl<T, Arr: AsMut<[FenceWaker]>> Send for OnceLockWait<'_, T, Arr> where T: Send {}
+/// Standard removal of the !Sync forced by [`UnsafeCell`].
+unsafe impl<T, Arr: AsMut<[FenceWaker]>> Sync for OnceLockWait<'_, T, Arr> where T: Send + Sync {}
 
 impl<'a, T, Arr> Future for OnceLockWait<'a, T, Arr>
 where
@@ -257,6 +306,7 @@ where
 }
 
 pin_project! {
+    /// Initializes [`OnceLock`] with the given future, returning the value.
     #[derive(Debug)]
     pub struct OnceLockSet<'a, T, Arr: AsMut<[FenceWaker]>, F: Future<Output = T>> {
         handle: FenceHolder<'a, Arr>,
@@ -264,6 +314,17 @@ pin_project! {
         #[pin]
         fut: F,
     }
+}
+
+/// Standard removal of the !Send forced by [`UnsafeCell`].
+unsafe impl<T, Arr: AsMut<[FenceWaker]>, F: Future<Output = T>> Send for OnceLockSet<'_, T, Arr, F> where
+    T: Send
+{
+}
+/// Standard removal of the !Sync forced by [`UnsafeCell`].
+unsafe impl<T, Arr: AsMut<[FenceWaker]>, F: Future<Output = T>> Sync for OnceLockSet<'_, T, Arr, F> where
+    T: Send + Sync
+{
 }
 
 impl<'a, T, Arr, F> Future for OnceLockSet<'a, T, Arr, F>
@@ -292,6 +353,9 @@ where
 }
 
 pin_project! {
+    /// Either initializes the [`OnceLock`] or waits for another initializer.
+    ///
+    /// In either case, this returns the value once it has been initialized.
     #[project = OnceLockInitProj]
     #[derive(Debug)]
     pub enum OnceLockInit<'a, T, Arr: AsMut<[FenceWaker]>, F: Future<Output = T>> {
@@ -319,6 +383,10 @@ impl<T, Arr> OnceLock<T, Arr>
 where
     Arr: AsMut<[FenceWaker]>,
 {
+    /// Returns a future for the inner value.
+    ///
+    /// If the value is uninitialized, and not currently being initialized,
+    /// `fut` will be used to initialize it.
     pub fn get_or_init<F>(&self, fut: F) -> OnceLockInit<'_, T, Arr, F>
     where
         F: Future<Output = T>,
@@ -341,49 +409,14 @@ where
         }
     }
 
+    /// Waits for initialization and returns that value.
+    ///
+    /// If the inner value is never initialized, the future will never
+    /// complete.
     pub fn wait(&self) -> OnceLockWait<'_, T, Arr> {
         OnceLockWait {
             handle: self.fence.wait(),
             data: &self.data,
-        }
-    }
-}
-
-pin_project! {
-    #[derive(Debug)]
-    pub struct OnceLockTrySet<'a, T, E, Arr: AsMut<[FenceWaker]>, F: Future<Output = Result<T, E>>> {
-        handle: FenceHolder<'a, Arr>,
-        data: &'a UnsafeCell<MaybeUninit<T>>,
-        #[pin]
-        fut: F,
-    }
-}
-
-impl<'a, T, E, Arr, F> Future for OnceLockTrySet<'a, T, E, Arr, F>
-where
-    Arr: AsMut<[FenceWaker]>,
-    F: Future<Output = Result<T, E>>,
-{
-    type Output = Result<&'a T, E>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-
-        // Waiter must complete before a result is ready/valid
-        match ready!(this.fut.poll(cx)) {
-            Ok(init_data) => {
-                // Guaranteed unique access
-                let data = unsafe { &mut *this.data.get() };
-                *data = MaybeUninit::new(init_data);
-
-                // Ordering ensures initialized data is synced
-                fence(Ordering::Release);
-                this.handle.release();
-
-                // Previously initialized
-                Poll::Ready(Ok(unsafe { data.assume_init_ref() }))
-            }
-            Err(init_err) => Poll::Ready(Err(init_err)),
         }
     }
 }

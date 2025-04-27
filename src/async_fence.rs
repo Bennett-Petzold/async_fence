@@ -57,7 +57,7 @@ where
 ///
 /// # Example
 /// ```
-/// use async_fence::{StaticFence};
+/// use async_fence::StaticFence;
 ///
 /// const FENCE_LEN: usize = 3;
 ///
