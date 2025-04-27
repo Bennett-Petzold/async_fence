@@ -9,13 +9,16 @@ use core::{
 
 use pin_project_lite::pin_project;
 
-use crate::{Fence, FenceHolder, FenceWaiter, FenceWaker};
+use crate::{Fence, FenceWaiter, FenceWaker};
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
 /// Async equivalent of
 /// [`std::sync::OnceLock`](<https://doc.rust-lang.org/stable/std/sync/struct.OnceLock.html>).
+///
+/// Construct with [`Self::new_arr`] for static backings.
+/// Use [`Self::default`] for dynamic backings.
 ///
 /// Produces futures that either set or wait for another future to set the
 /// value. The methods never block. [`Self::get_or_init`] is the main method.
@@ -196,7 +199,7 @@ where
 
             // Memory fencing ensures other threads see the data change
             fence(Ordering::Release);
-            drop(self.fence.hold());
+            self.fence.release();
             Ok(())
         } else {
             Err(value)
@@ -215,7 +218,7 @@ where
 
             // Memory fencing ensures other threads see the data change
             fence(Ordering::Release);
-            drop(self.fence.hold());
+            self.fence.release();
 
             // Guaranteed by prior operations
             Ok(unsafe { (*self.data.get()).assume_init_ref() })
@@ -309,7 +312,7 @@ pin_project! {
     /// Initializes [`OnceLock`] with the given future, returning the value.
     #[derive(Debug)]
     pub struct OnceLockSet<'a, T, Arr: AsMut<[FenceWaker]>, F: Future<Output = T>> {
-        handle: FenceHolder<'a, Arr>,
+        handle: &'a Fence<Arr>,
         data: &'a UnsafeCell<MaybeUninit<T>>,
         #[pin]
         fut: F,
@@ -401,7 +404,7 @@ where
         } else {
             OnceLockInit::Set {
                 set: OnceLockSet {
-                    handle: self.fence.hold(),
+                    handle: &self.fence,
                     data: &self.data,
                     fut,
                 },
