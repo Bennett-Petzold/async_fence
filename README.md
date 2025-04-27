@@ -22,8 +22,7 @@ and dynamic support.
 
 ## TODO
 * Support for smallvec
-* LazyLock implementation
-* OnceLock implementation
+* Look into removing mutex entirely through atomic fencing
 
 [CrateStatus]: https://img.shields.io/crates/v/async_fence.svg
 [Crate]: https://crates.io/crates/async_fence

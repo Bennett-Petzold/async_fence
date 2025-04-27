@@ -1,6 +1,6 @@
 [package]
 name = "async_fence"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Bennett Petzold <dansecob.dev@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
@@ -13,8 +13,11 @@ readme = "README.md"
 
 [features]
 alloc = []
+once = ["dep:pin-project-lite"]
+lazy = ["once"]
 
 [dependencies]
+pin-project-lite = { version = "0.2", optional = true }
 spin = "0.10"
 
 [dev-dependencies]

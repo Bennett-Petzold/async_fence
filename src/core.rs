@@ -27,7 +27,7 @@ extern crate alloc;
 
 pub type FenceWaker = MaybeUninit<Waker>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct FenceQueue<Arr: AsMut<[FenceWaker]>> {
     data: Arr,
     pos: usize,
@@ -57,21 +57,19 @@ where
 ///
 /// # Example
 /// ```
-/// use async_fence::{StaticFence};
+/// use async_fence::StaticFence;
 ///
 /// const FENCE_LEN: usize = 3;
 ///
 /// // This fence will live for the entire program.
 /// static FENCE: StaticFence<FENCE_LEN> = StaticFence::new_arr();
 ///
-/// let holder = FENCE.hold();
-///
 /// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
 /// rt.block_on(async {
 ///     let handles: [_; 3] = core::array::from_fn(|_| tokio::spawn(FENCE.wait()));
 ///
-///     // After the holder is dropped, all the waiters finish.
-///     drop(holder);
+///     // After the fence is released, all the waiters finish.
+///     FENCE.release();
 ///     for handle in handles {
 ///         handle.await;
 ///     }
@@ -125,9 +123,9 @@ where
         let mut queue = self.queue.lock();
         let pos = queue.pos;
 
-        // Cleans up any wakers left over by a fence holder
+        // Cleans up any wakers not dropped by a release.
         if pos > 0 {
-            // All indicies before the pointer are initialized wakers
+            // All indicies before the pointer are initialized wakers.
             for entry in &mut queue.data.as_mut()[0..pos] {
                 let mut local_entry = MaybeUninit::uninit();
                 core::mem::swap(entry, &mut local_entry);
@@ -155,6 +153,12 @@ where
 /// Initialize this with [`Self::new_arr`].
 pub type StaticFence<const N: usize> = Fence<[FenceWaker; N]>;
 
+#[cfg(feature = "alloc")]
+/// A [`Fence`] based on a [`Vec`][`alloc::vec::Vec`].
+///
+/// Initialize this with [`Self::default`].
+pub type VecFence = Fence<alloc::vec::Vec<FenceWaker>>;
+
 impl<const N: usize> StaticFence<N> {
     pub const fn new_arr() -> Self {
         // This works because:
@@ -167,89 +171,20 @@ impl<const N: usize> StaticFence<N> {
     }
 }
 
-/// Releases the [`Fence`] on [`Drop`].
-///
-/// This is constructed via [`Fence::hold`].
-/// All fields are borrowed from the originating [`Fence`].
-/// ANY copy of this for a given [`Fence`] will release the fence.
-/// Once the [`Fence`] is released, it cannot be re-enabled.
-#[derive(Debug, Clone)]
-pub struct FenceHolder<'a, Arr: AsMut<[FenceWaker]>> {
-    source: &'a Fence<Arr>,
-}
-
 impl<Arr> Fence<Arr>
 where
     Arr: AsMut<[FenceWaker]>,
 {
-    /// Produces a handle to release the fence on drop.
-    pub fn hold<'a>(&'a self) -> FenceHolder<'a, Arr>
-    where
-        Arr: 'a,
-    {
-        FenceHolder { source: self }
-    }
-}
+    /// Releases the [`Fence`].
+    ///
+    /// Once the [`Fence`] is released, it cannot be re-enabled.
+    pub fn release(&self) {
+        self.finished.store(true, Ordering::Release);
 
-impl<Arr> FenceHolder<'_, Arr>
-where
-    Arr: AsMut<[FenceWaker]>,
-{
-    pub const fn source(&self) -> &Fence<Arr> {
-        self.source
-    }
-}
-
-impl<Arr> PartialEq for FenceHolder<'_, Arr>
-where
-    Arr: AsMut<[FenceWaker]>,
-{
-    fn eq(&self, other: &Self) -> bool {
-        // The finished comparison can be skipped, as
-        core::ptr::eq(self.source as *const _, other.source as *const _)
-    }
-}
-
-impl<Arr> Eq for FenceHolder<'_, Arr> where Arr: AsMut<[FenceWaker]> {}
-
-impl<Arr> PartialOrd for FenceHolder<'_, Arr>
-where
-    Arr: AsMut<[FenceWaker]>,
-{
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<Arr> Ord for FenceHolder<'_, Arr>
-where
-    Arr: AsMut<[FenceWaker]>,
-{
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        (self.source as *const _ as usize).cmp(&(other.source as *const _ as usize))
-    }
-}
-
-impl<Arr> Hash for FenceHolder<'_, Arr>
-where
-    Arr: AsMut<[FenceWaker]>,
-{
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        state.write_usize(self.source as *const _ as usize);
-    }
-}
-
-impl<Arr> Drop for FenceHolder<'_, Arr>
-where
-    Arr: AsMut<[FenceWaker]>,
-{
-    fn drop(&mut self) {
-        self.source.finished.store(true, Ordering::Release);
-
-        // Cleans up any wakers left over by a fence holder
-        let mut queue = self.source.queue.lock();
+        // Notifies and drops all waiters prior to this release.
+        let mut queue = self.queue.lock();
         if queue.pos > 0 {
-            // Zeroing out the queue pointer makes any future FenceHolders skip
+            // Zeroing out the queue pointer makes any future releases skip
             let pos = core::mem::replace(&mut queue.pos, 0);
 
             // All indicies before the pointer are initialized wakers
@@ -263,7 +198,7 @@ where
     }
 }
 
-/// Waits for a [`Fence`] to release via [`FenceHolder`].
+/// Waits for a [`Fence`] to release.
 ///
 /// When [`Future::poll`] finishes, the [`Fence`] is released.
 ///
@@ -382,7 +317,7 @@ where
 
     // If the try lock fails (aside from spurious failure), there are two
     // likely scenarios:
-    // 1. The holder updated finished and is waking queues
+    // 1. The release was called and is waking queues
     // 2. Another waiter is inserting into the queue
     //
     // In either case, tossing this to the back of the async queue avoids
@@ -510,27 +445,24 @@ where
     ///
     /// # Example
     /// ```
-    /// use async_fence::{Fence, FenceWaker};
+    /// use async_fence::core::{Fence, FenceWaker};
     ///
-    /// use std::{sync::LazyLock, vec::Vec};
+    /// use std::{sync::LazyLock as StdLazyLock, vec::Vec};
     ///
     /// // This fence has dynamic storage and will live for the entire program.
-    /// static FENCE: LazyLock<Fence<Vec<FenceWaker>>> = LazyLock::new(Fence::default);
-    ///
-    /// let holder = FENCE.hold();
+    /// static FENCE: StdLazyLock<Fence<Vec<FenceWaker>>> = StdLazyLock::new(Fence::default);
     ///
     /// // This preallocates for 3 non-dynamic wait entries.
     /// FENCE.fill_storage(3);
     ///
     /// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
     /// rt.block_on(async {
-    ///
     ///     // The fence storage will not extend further, as this is a regular
     ///     // wait handle.
     ///     let handles: [_; 3] = core::array::from_fn(|_| tokio::spawn(FENCE.wait()));
     ///
-    ///     // After the holder is dropped, all the waiters finish.
-    ///     drop(holder);
+    ///     // After the fence is released, all the waiters finish.
+    ///     FENCE.release();
     ///     for handle in handles {
     ///         handle.await;
     ///     }
@@ -546,27 +478,25 @@ where
     ///
     /// # Example
     /// ```
-    /// use async_fence::{Fence, FenceWaker};
+    /// use async_fence::{Fence, VecFence};
     ///
     /// use std::{sync::LazyLock, vec::Vec};
     ///
     /// // This fence has dynamic storage and will live for the entire program.
-    /// static FENCE: LazyLock<Fence<Vec<FenceWaker>>> = LazyLock::new(Fence::default);
+    /// static FENCE: LazyLock<VecFence> = LazyLock::new(Fence::default);
     ///
     /// // This is an alternative that executes const, and plays by the unsafe
     /// // rules. Const function cannot currently be set for a trait, so this
     /// // has to be done manually.
-    /// static UNSAFE_FENCE: Fence<Vec<FenceWaker>> = unsafe { Fence::new(Vec::new()) };
-    ///
-    /// let holder = FENCE.hold();
+    /// static UNSAFE_FENCE: VecFence = unsafe { Fence::new(Vec::new()) };
     ///
     /// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
     /// rt.block_on(async {
     ///     // The fence storage will extend to fit all the handles.
     ///     let handles: [_; 3] = core::array::from_fn(|_| tokio::spawn(FENCE.wait_extending()));
     ///
-    ///     // After the holder is dropped, all the waiters finish.
-    ///     drop(holder);
+    ///     // After the fence is released, all the waiters finish.
+    ///     FENCE.release();
     ///     for handle in handles {
     ///         handle.await;
     ///     }
@@ -626,22 +556,20 @@ mod tests {
     async fn waits_on_holder() {
         static FENCE: StaticFence<FENCE_LEN> = StaticFence::new_arr();
 
-        let holder = FENCE.hold();
-
         let mut handles = JoinSet::new();
         for _ in 0..FENCE_LEN {
             handles.spawn(FENCE.wait());
         }
 
-        // None of the waiters finish before the holder is dropped.
+        // None of the waiters finish before the fence is released.
         assert!(
             timeout(Duration::from_secs(1), handles.join_next())
                 .await
                 .is_err()
         );
 
-        // After the holder is dropped, all the waiters finish.
-        drop(holder);
+        // After the fence is released, all the waiters finish.
+        FENCE.release();
         assert!(
             timeout(Duration::from_secs(1), handles.join_all())
                 .await
@@ -676,7 +604,7 @@ mod tests {
     async fn instant_pass_post_hold() {
         static FENCE: StaticFence<FENCE_LEN> = StaticFence::new_arr();
 
-        drop(FENCE.hold());
+        FENCE.release();
         let handles: [_; FENCE_LEN] = core::array::from_fn(|_| FENCE.wait());
 
         for handle in handles {
@@ -685,13 +613,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_fence_hold_drop() {
+    async fn multi_fence_release() {
         static FENCE: StaticFence<FENCE_LEN> = StaticFence::new_arr();
 
-        drop(FENCE.hold());
+        FENCE.release();
         let handles: [_; FENCE_LEN] = core::array::from_fn(|_| FENCE.wait());
         // This should have absolutely zero effect on state.
-        drop(FENCE.hold());
+        FENCE.release();
 
         for handle in handles {
             assert_eq!(poll!(handle), Poll::Ready(()));
@@ -701,8 +629,6 @@ mod tests {
     #[tokio::test]
     async fn excess_waiters() {
         static FENCE: StaticFence<FENCE_LEN> = StaticFence::new_arr();
-
-        let holder = FENCE.hold();
 
         let mut handles: [_; FENCE_LEN] = core::array::from_fn(|_| FENCE.wait());
         let mut excess_handles: [_; FENCE_LEN * 10] = core::array::from_fn(|_| FENCE.wait());
@@ -735,8 +661,8 @@ mod tests {
             }
         }
 
-        // After the holder is dropped, ALL the waiters finish.
-        drop(holder);
+        // After the fence is released, ALL the waiters finish.
+        FENCE.release();
 
         let mut all_handles = JoinSet::new();
         for handle in handles.into_iter().chain(excess_handles) {

@@ -23,8 +23,22 @@ Contributions are welcome at
 <https://github.com/Bennett-Petzold/async_fence>.
 */
 
-mod async_fence;
-pub use async_fence::*;
+pub mod core;
+#[cfg(feature = "alloc")]
+pub use core::VecFence;
+pub use core::{Fence, StaticFence};
 
 #[cfg(feature = "alloc")]
 pub mod extending_arr;
+
+#[cfg(feature = "once")]
+pub mod once;
+#[cfg(all(feature = "once", feature = "alloc"))]
+pub use once::VecOnceLock;
+#[cfg(feature = "once")]
+pub use once::{OnceLock, StaticOnceLock};
+
+#[cfg(feature = "lazy")]
+pub mod lazy;
+#[cfg(feature = "lazy")]
+pub use lazy::LazyLock;

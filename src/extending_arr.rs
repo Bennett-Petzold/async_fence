@@ -3,7 +3,7 @@ use core::{mem::MaybeUninit, ops::RangeBounds};
 extern crate alloc;
 use alloc::vec::Vec;
 
-use crate::FenceWaker;
+use crate::core::FenceWaker;
 
 /// Array wrapper that may extend (e.g. [`Vec`]).
 pub trait WakerArrExtending: Default + AsMut<[FenceWaker]> {
