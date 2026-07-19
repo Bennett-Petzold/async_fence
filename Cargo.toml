@@ -18,7 +18,7 @@ lazy = ["once"]
 
 [dependencies]
 pin-project-lite = { version = "0.2", optional = true }
-spin = "0.10"
+spin = "0.11"
 
 [dev-dependencies]
 futures = "0.3.31"
